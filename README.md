@@ -130,6 +130,9 @@ reach the discussion phase.
 | Living players, in server | `!mafia vote <player-number>` | Casts a final vote to eliminate another living player. |
 | Living players, in server | `!mafia vote skip` | Casts a final vote for no elimination. |
 | Host | `!mafia cancel` | Clears the lobby and invalidates its role assignments. |
+| Host | `!mafia transfer <player-number>` | Hands hosting to another participant. |
+| Player | `!mafia forfeit` | Permanently leaves an active match; this may decide the winner. |
+| Server manager | `!mafia forcecancel` | Stops a game; requires Manage Server permission. |
 | Anyone | `!mafia` | Shows the commands. |
 
 Before starting, each player should allow DMs from the bot (Discord's server
@@ -204,13 +207,14 @@ produce no elimination. After the result:
 
 - **Citizens win** if all Mafia players are eliminated.
 - **Mafia wins** if the Mafia equals or outnumbers the remaining Citizens.
+- **Draw** after three consecutive complete rounds with no eliminations.
 - Otherwise, **Night 2, Night 3, and later rounds** begin automatically.
 
 Roles are assigned only once. Before every later night, the Mafia gets a fresh
 DM listing living targets. Ready votes and daytime votes reset for the next
 round. Eliminated players may watch but cannot choose targets, mark ready, or vote.
 The host can still cancel even if eliminated. Completed games stop their worker;
-use `!mafia cancel` to clear the channel for a fresh lobby.
+use `!mafia cancel` to clear the channel immediately, or wait for automatic cleanup.
 
 Target selection is accepted only in DMs, during the night, from that game's
 living Mafia player. Self-targets, eliminated players, invalid numbers, repeat
@@ -227,19 +231,53 @@ There are no automatic channel mutes. Players can use text or voice for discussi
 Use `!mafia lobby` to see the current phase and which players are eliminated;
 player numbers stay the same after a death.
 
-Once roles have been sent, joining, leaving, and starting again are blocked.
-The host can cancel to try again. Membership is also frozen while DMs are being
-sent, so overlapping commands cannot change who gets a role.
+Once roles have been sent, joining and starting again are blocked. Use
+`!mafia forfeit` to leave permanently. During message delivery, wait for the next
+phase before forfeiting or transferring hosting. The host can cancel at any time,
+including while role DMs are being sent.
 
 Each channel has an independent lobby, but each player may join **one active
 game at a time**, including waiting lobbies. This keeps private commands
-unambiguous. Leave an open lobby, have its host cancel, or wait until the game
-finishes before joining another. Eliminated players still belong to their game
-until it finishes or is cancelled. A finished game releases its players, although
-its host must cancel it before creating another lobby in that same channel.
+unambiguous. Leave an open lobby, forfeit, have its host cancel, or wait until the
+game finishes before joining another. Eliminated players still belong to their
+game unless they forfeit. A finished game releases its players immediately.
 All lobbies are stored in memory: restarting the bot clears them and invalidates
-old role DMs. If the host disappears, restart the bot to clear a stranded lobby;
-this also clears the other channels' lobbies.
+old role DMs. Games do not resume after a restart.
+
+### Leaving, abandoned games, and cleanup
+
+The host can use `!mafia transfer 2` with a number from `!mafia lobby`. If the
+host leaves a waiting lobby or forfeits an active game, hosting passes to the
+first remaining eligible player. The final player leaving closes the lobby.
+Other players cannot start or cancel it; server managers can use
+`!mafia forcecancel` when intervention is needed.
+
+Forfeiting removes the player from play without revealing their role. Votes cast
+by or against them are cleared; affected voters may vote again. A departed night
+target is cleared. Player numbers stay fixed during active games. A forfeit can
+immediately produce a team win. If everyone leaves, the game closes without
+declaring a winner.
+
+| Cleanup rule | Default |
+| --- | --- |
+| Waiting lobby not started | Expires 10 minutes after creation. |
+| Active game without a valid player action | Closes after 15 minutes of inactivity. |
+| Finished game | Clears from its channel after 5 minutes. |
+| Consecutive complete rounds without eliminations | Draw after 3 rounds. |
+| Maintenance and server membership checks | Runs every 30 seconds, plus request time. |
+
+These settings live in `LifecyclePolicy` in `mafia_lifecycle.py`. Expiry cleanup
+may wait for the next maintenance pass. The bot confirms server departures with
+Discord membership requests; going offline does not remove a player. This does
+not require the privileged Server Members Intent. Failed membership requests
+keep unverified players rather than treating them as departed.
+
+One game worker applies departures between phase announcements. Startup and
+worker tasks are tracked and cancelled on shutdown or game cancellation, so an
+old task cannot start a later phase in a replacement game. Critical network
+requests time out after 5 seconds. Temporary phase delivery failures allow up
+to 5 attempts, 5 seconds apart, then close the game. A blocked later-night DM
+also stops the game with a generic public message that keeps roles private.
 
 ### Understand the new code
 
@@ -251,6 +289,8 @@ Start with the rules, then read the commands that call them.
 | `mafia_game.py` | Players, roles, legal actions, votes, and winners. Uses only standard Python. | `GameState`, then `lock_target()` and `cast_vote()` |
 | `mafia.py` | Discord commands, message formatting, and the game worker. | `Lobby`, `Mafia.kill()`, then `run_game()` |
 | `mafia_cards.py` | Titles, colors, fields, readable durations, and text fallback. | `night_card()`, `morning_card()`, then `send_card()` |
+| `mafia_lifecycle.py` | Cleanup policy and confirmed server departure checks. | `LifecyclePolicy`, then `check_once()` |
+| `scripts/simulate_games.py` | Complete offline games with deterministic random players. | `simulate_match()` |
 | `bot.py` | Loads the token, configures the Discord connection, and registers commands. | `DBot.setup_hook()` and `bot.run(token)` |
 | `tests/` | Checks both the rules and the Discord integration with fake messages. | `test_mafia_game.py`, then `test_mafia.py` |
 
@@ -383,8 +423,8 @@ before resolving or deleting anything, protecting replacement games.
 `GameRuleError` means a player tried an illegal action. The Discord adapter
 turns it into a readable reply. These rule exceptions do not need Discord imports.
 
-Temporary HTTP failures retry phase messages every five seconds, preserving
-the same result. If the channel was deleted or permissions were removed, the bot
+Temporary HTTP failures retry phase messages every five seconds, up to five
+attempts, preserving the same result. If the channel was deleted or permissions were removed, the bot
 stops the game, frees its participants, and attempts to notify the host by DM.
 Other permanent Discord request errors also stop the game instead of retrying
 forever. If only Embed Links permission changed, card delivery retries as text.
@@ -400,6 +440,18 @@ The role names are game data, not Discord server roles; the bot does not need
 Manage Roles permission. Keep the token in your own `.env`, as before.
 
 ### Check your changes
+
+You can run complete games alone without starting the bot:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.simulate_games --games 500 --seed 7
+```
+
+This runs 3–6 simulated players with a clock that advances instantly. Every tenth
+game deliberately makes no elimination to exercise the draw limit. It checks
+that every game ends, roles and numbers stay fixed, and eliminated players do
+not return. The same seed reproduces the run. Random-player results do not
+measure balance with human players.
 
 Automated checks need no token, extra test packages, or Discord connection:
 
@@ -455,7 +507,8 @@ are ignored by Git.
   both places, and the channel's permissions.
 - **Announcements appear as text instead of cards:** enable Embed Links for the
   bot in that channel. The text fallback keeps the game playable without it.
-- **Morning cannot be posted:** temporary delivery errors retry every five seconds.
+- **Morning cannot be posted:** temporary delivery errors allow five attempts,
+  five seconds apart, then close the game.
   If the channel was deleted or Send Messages permission was removed, the game is
   cancelled and the bot tries to DM the host. Fix the channel access and create
   a new lobby. Unexpected worker failures are reported in the bot's terminal.

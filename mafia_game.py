@@ -2,11 +2,12 @@
 
 import random
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 MIN_PLAYERS = 3
 MAX_PLAYERS = 6
+MAX_PEACEFUL_ROUNDS = 3
 
 
 class Phase(StrEnum):
@@ -22,6 +23,7 @@ class Phase(StrEnum):
     OPENING_NIGHT = "opening_night"
     FINISHED = "finished"
     CANCELLED = "cancelled"
+    DEPARTING = "departing"
 
 
 class Role(StrEnum):
@@ -38,6 +40,8 @@ class EliminationOutcome:
     victim_id: int | None
     survivors: frozenset[int]
     winner: Role | None
+    draw: bool = False
+    peaceful_rounds: int = 0
 
     @property
     def mafia_wins(self) -> bool:
@@ -58,6 +62,9 @@ class GameState:
     voting_deadline: float | None = None
     ready_players: set[int] = field(default_factory=set)
     votes: dict[int, int | None] = field(default_factory=dict)
+    forfeited: set[int] = field(default_factory=set)
+    peaceful_rounds: int = 0
+    round_start_size: int = 0
 
     def __post_init__(self):
         self.players = [self.host_id]
@@ -82,15 +89,51 @@ class GameState:
         self.require_open()
         if player_id not in self.players:
             raise GameRuleError("You are not in this lobby.")
-        if player_id == self.host_id:
-            raise GameRuleError("As host, use `!mafia cancel` to close the lobby.")
         self.players.remove(player_id)
+        if not self.players:
+            self.phase = Phase.CANCELLED
+        elif player_id == self.host_id:
+            self.host_id = self.players[0]
 
-    def begin_assignment(self) -> None:
+    def transfer_host(self, actor_id: int, player_number: int) -> int:
+        self.require_host(actor_id)
+        if not 1 <= player_number <= len(self.players):
+            raise GameRuleError("Choose a player number from `!mafia lobby`.")
+        target = self.players[player_number - 1]
+        if target == actor_id:
+            raise GameRuleError("You are already the host.")
+        if target in self.forfeited or (self.roles and target not in self.alive):
+            raise GameRuleError("Choose a player who is still in the game.")
+        self.host_id = target
+        return target
+
+    def forfeit_players(self, player_ids: set[int]) -> EliminationOutcome:
+        """Preserve roster numbers while removing departed participants and their actions."""
+        if self.phase not in (Phase.NIGHT, Phase.DISCUSSION, Phase.VOTING, Phase.NEXT_NIGHT):
+            raise GameRuleError("Wait until the current announcement finishes before leaving.")
+        if not player_ids <= set(self.players):
+            raise GameRuleError("That player is not in this game.")
+        self.forfeited.update(player_ids)
+        self.alive.difference_update(player_ids)
+        self.ready_players.difference_update(player_ids)
+        self.votes = {
+            actor: target
+            for actor, target in self.votes.items()
+            if actor not in player_ids and target not in player_ids
+        }
+        if self.night_target in player_ids:
+            self.night_target = None
+        if self.host_id in player_ids:
+            self.host_id = next(
+                (player for player in self.players if player in self.alive), self.host_id
+            )
+        return self.elimination_outcome(None)
+
+    def begin_assignment(self, rng: random.Random | None = None) -> None:
         self.require_open()
         if len(self.players) < MIN_PLAYERS:
             raise GameRuleError(f"You need at least {MIN_PLAYERS} players, including the host.")
-        mafia_id = random.choice(self.players)
+        mafia_id = (rng or random).choice(self.players)
         self.roles = {
             player: Role.MAFIA if player == mafia_id else Role.CITIZEN for player in self.players
         }
@@ -101,6 +144,7 @@ class GameState:
         if self.phase not in (Phase.ASSIGNING, Phase.OPENING_NIGHT):
             raise GameRuleError("The game is not ready for night.")
         self.night_number += 1
+        self.round_start_size = len(self.alive)
         self.night_target = None
         self.ready_players.clear()
         self.votes.clear()
@@ -134,13 +178,12 @@ class GameState:
         survivors = self.alive - {victim_id} if victim_id is not None else set(self.alive)
         mafia_count = sum(self.roles[player] == Role.MAFIA for player in survivors)
         citizen_count = len(survivors) - mafia_count
-        winner = (
-            Role.CITIZEN
-            if mafia_count == 0
-            else Role.MAFIA
-            if mafia_count >= citizen_count
-            else None
-        )
+        if not survivors:
+            winner = None
+        elif mafia_count == 0:
+            winner = Role.CITIZEN
+        else:
+            winner = Role.MAFIA if mafia_count >= citizen_count else None
         return EliminationOutcome(victim_id, frozenset(survivors), winner)
 
     def prepare_morning(self) -> EliminationOutcome:
@@ -226,6 +269,16 @@ class GameState:
             (target for target, count in counts.items() if count >= self.majority), None
         )
         outcome = self.elimination_outcome(victim_id)
+        peaceful = (
+            self.peaceful_rounds + 1
+            if self.round_start_size > 0 and len(outcome.survivors) == self.round_start_size
+            else 0
+        )
+        outcome = replace(
+            outcome,
+            peaceful_rounds=peaceful,
+            draw=outcome.winner is None and peaceful >= MAX_PEACEFUL_ROUNDS,
+        )
         self.phase = Phase.COUNTING
         return outcome
 
@@ -233,7 +286,8 @@ class GameState:
         if self.phase != Phase.COUNTING:
             raise GameRuleError("No vote result is being announced.")
         self.alive = set(outcome.survivors)
-        self.phase = Phase.FINISHED if outcome.winner else Phase.NEXT_NIGHT
+        self.peaceful_rounds = outcome.peaceful_rounds
+        self.phase = Phase.FINISHED if outcome.winner or outcome.draw else Phase.NEXT_NIGHT
 
     def prepare_next_night(self) -> None:
         if self.phase != Phase.NEXT_NIGHT:

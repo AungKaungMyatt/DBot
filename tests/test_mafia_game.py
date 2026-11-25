@@ -24,10 +24,10 @@ class GameStateTests(unittest.TestCase):
         game.leave(20)
         game.join(40)
         self.assertEqual(game.players, [10, 30, 40])
+        game.leave(10)
+        self.assertEqual(game.host_id, 30)
         with self.assertRaises(GameRuleError):
-            game.leave(10)
-        with self.assertRaises(GameRuleError):
-            game.require_host(30)
+            game.require_host(10)
 
     def test_assignment_requires_enough_players_and_freezes_membership(self):
         game = GameState(host_id=10)
@@ -269,6 +269,62 @@ class GameStateTests(unittest.TestCase):
                     self.assertEqual(game.players, players)
                     checked += 1
         self.assertEqual(checked, 2692)
+
+    def test_last_host_leaving_closes_waiting_lobby(self):
+        game = GameState(10)
+        with self.assertRaises(GameRuleError):
+            game.leave(99)
+        game.leave(10)
+        self.assertEqual(game.phase, Phase.CANCELLED)
+        self.assertFalse(game.players)
+
+    def test_forfeits_clean_votes_readiness_and_transfer_host_without_renumbering(self):
+        game = self.game_in_voting()
+        game.votes = {10: 11, 11: 10, 12: None, 13: 10}
+        game.ready_players = {10, 11}
+        game.forfeit_players({11})
+        self.assertEqual(game.votes, {12: None, 13: 10})
+        self.assertEqual(game.ready_players, {10})
+        self.assertEqual(game.majority, 3)
+        outcome = game.forfeit_players({10})
+        self.assertEqual(outcome.winner, Role.CITIZEN)
+        self.assertEqual(game.host_id, 12)
+        self.assertEqual(game.players, [10, 11, 12, 13, 14])
+        self.assertEqual(game.votes, {12: None})
+
+    def test_forfeit_target_is_cleared_and_everyone_leaving_is_not_a_team_win(self):
+        game = self.game_at_night()
+        game.lock_target(10, 3, now=101)
+        game.forfeit_players({12})
+        self.assertIsNone(game.night_target)
+        game.lock_target(10, 4, now=102)
+        outcome = game.forfeit_players(set(game.players))
+        self.assertIsNone(outcome.winner)
+        self.assertFalse(outcome.survivors)
+
+    def test_forfeit_and_transfer_reject_invalid_participants(self):
+        game = GameState(10)
+        with self.assertRaises(GameRuleError):
+            game.forfeit_players({10})
+        game = self.game_at_night()
+        with self.assertRaises(GameRuleError):
+            game.forfeit_players({99})
+        game.forfeit_players({11})
+        for actor, number in ((12, 3), (10, 1), (10, 0), (10, 6), (10, 2)):
+            with self.assertRaises(GameRuleError):
+                game.transfer_host(actor, number)
+        self.assertEqual(game.transfer_host(10, 3), 12)
+
+    def test_night_elimination_resets_the_peaceful_round_streak(self):
+        game = self.game_at_night()
+        game.peaceful_rounds = 2
+        game.lock_target(10, 3, now=101)
+        game.complete_morning(game.prepare_morning(), now=102, duration=120)
+        game.prepare_voting()
+        game.begin_voting(now=103, duration=60)
+        outcome = game.prepare_vote_result()
+        self.assertFalse(outcome.draw)
+        self.assertEqual(outcome.peaceful_rounds, 0)
 
 
 if __name__ == "__main__":

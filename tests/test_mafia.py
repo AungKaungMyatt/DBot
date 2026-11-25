@@ -10,85 +10,10 @@ from discord.ext import commands
 
 from mafia import Mafia
 from mafia_game import GameRuleError
+from tests.fakes import DiscordGameFixture, message_text
 
 
-def message_text(call):
-    """Read either a plain reply or a card without coupling game tests to layout."""
-    parts = [str(call.args[0])] if call.args else []
-    card = call.kwargs.get("embed")
-    if card is not None:
-        parts.extend([card.title or "", card.description or ""])
-        for field in card.fields:
-            parts.extend([field.name, field.value])
-        parts.append(card.footer.text or "")
-    return "\n".join(parts)
-
-
-class MafiaTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self.cog = Mafia()
-        self.members = {
-            i: SimpleNamespace(
-                id=i, display_name=f"Player {i}", mention=f"<@{i}>", send=AsyncMock()
-            )
-            for i in range(1, 15)
-        }
-        self.channels = {}
-
-    async def asyncTearDown(self):
-        await self.cog.cog_unload()
-
-    def context(self, player=1, channel=100, private=False):
-        if channel not in self.channels:
-            self.channels[channel] = SimpleNamespace(
-                id=channel, mention=f"<#{channel}>", send=AsyncMock()
-            )
-        return SimpleNamespace(
-            author=self.members[player],
-            channel=self.channels[channel],
-            guild=None if private else SimpleNamespace(name="Test server"),
-            message=SimpleNamespace(id=900 + channel),
-            send=AsyncMock() if private else self.channels[channel].send,
-        )
-
-    async def invoke(self, command, player=1, channel=100):
-        ctx = self.context(player, channel)
-        await getattr(self.cog, command).callback(self.cog, ctx)
-        return ctx
-
-    async def ready_lobby(self, count=3, channel=100, host=1):
-        await self.invoke("create", host, channel)
-        for player in range(host + 1, host + count):
-            await self.invoke("join", player, channel)
-
-    async def night_game(self, count=5, channel=100, host=1, mafia_player=None):
-        await self.ready_lobby(count, channel, host)
-        with patch(
-            "mafia_game.random.choice", return_value=host if mafia_player is None else mafia_player
-        ):
-            await self.invoke("start", host, channel)
-        self.channels[channel].send.reset_mock()
-        return self.cog.lobbies[channel]
-
-    async def choose(self, target=2, player=1, send=None):
-        ctx = self.context(player, channel=999, private=True)
-        if send is not None:
-            ctx.send = send
-        await self.cog.kill.callback(self.cog, ctx, target)
-        return ctx
-
-    async def finish(self, lobby):
-        async def transitioned():
-            while lobby.game.phase not in ("discussion", "finished", "cancelled"):
-                if lobby.game_task.done():
-                    raise AssertionError("Game worker stopped before the phase completed")
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(transitioned(), timeout=3)
-
-    def delivery_error(self):
-        return discord.HTTPException(SimpleNamespace(status=503, reason="Unavailable"), "Try again")
-
+class MafiaTests(DiscordGameFixture, unittest.IsolatedAsyncioTestCase):
     async def test_create_joins_host_and_rejects_duplicate(self):
         await self.invoke("create")
         self.assertEqual(list(self.cog.lobbies[100].game.players), [1])
@@ -106,13 +31,14 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(GameRuleError):
             await self.invoke("join", 7)
 
-    async def test_leave_and_host_must_cancel(self):
+    async def test_leave_transfers_host_to_next_waiting_player(self):
         await self.ready_lobby()
         await self.invoke("leave", 2)
         self.assertNotIn(2, self.cog.lobbies[100].game.players)
-        for player in (1, 2):
-            with self.assertRaises(GameRuleError):
-                await self.invoke("leave", player)
+        with self.assertRaises(GameRuleError):
+            await self.invoke("leave", 2)
+        await self.invoke("leave", 1)
+        self.assertEqual(self.cog.lobbies[100].game.host_id, 3)
 
     async def test_start_requires_host_and_three_players(self):
         await self.ready_lobby(count=2)
@@ -178,7 +104,7 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
         lobby = self.cog.lobbies[100]
         ctx = self.context()
         ctx.send.side_effect = self.delivery_error()
-        with self.assertRaises(discord.HTTPException):
+        with self.assertLogs("mafia", level="WARNING"):
             await self.cog.start.callback(self.cog, ctx)
         self.assertNotIn(100, self.cog.lobbies)
         self.assertIsNone(lobby.game_task)
@@ -200,7 +126,7 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(lobby.game.phase, "assigning")
             self.assertIsNone(lobby.game.night_deadline)
             self.assertIsNone(lobby.game_task)
-            for command, player in (("join", 4), ("leave", 2), ("start", 1), ("cancel", 1)):
+            for command, player in (("join", 4), ("leave", 2), ("start", 1)):
                 with self.assertRaises(GameRuleError):
                     await self.invoke(command, player)
         finally:
@@ -357,8 +283,6 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(sending.wait(), timeout=3)
             self.assertEqual(lobby.game.phase, "resolving")
             with self.assertRaises(GameRuleError):
-                await self.invoke("cancel")
-            with self.assertRaises(GameRuleError):
                 await self.choose(4)
             await self.cog.resolve_night(100, lobby)
             self.channels[100].send.assert_awaited_once()
@@ -512,7 +436,7 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
             await self.cog.cog_unload()
         finally:
             release.set()
-            await task
+            await asyncio.gather(task, return_exceptions=True)
         self.assertIsNone(lobby.game_task)
         self.assertFalse(self.cog.lobbies)
         self.members[2].send.assert_not_awaited()
@@ -535,30 +459,9 @@ class MafiaTests(unittest.IsolatedAsyncioTestCase):
             await self.cog.cog_unload()
         finally:
             release.set()
-            await task
+            await asyncio.gather(task, return_exceptions=True)
         self.assertIsNone(lobby.game_task)
         self.assertFalse(self.cog.lobbies)
-
-    async def wait_phase(self, lobby, phase, night=None):
-        async def reached():
-            while lobby.game.phase != phase or (
-                night is not None and lobby.game.night_number != night
-            ):
-                if lobby.game_task.done():
-                    raise AssertionError(f"Worker stopped at {lobby.game.phase}, expected {phase}")
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(reached(), timeout=5)
-
-    async def skip_to_voting(self, lobby):
-        for player in sorted(lobby.game.alive)[: lobby.game.majority]:
-            await self.invoke("ready", player)
-        await self.wait_phase(lobby, "voting")
-
-    async def cast(self, player, selection):
-        ctx = self.context(player)
-        await self.cog.vote.callback(self.cog, ctx, str(selection))
-        return ctx
 
     async def test_two_round_game_keeps_roles_and_finishes_with_citizen_victory(self):
         lobby = await self.night_game(count=6)

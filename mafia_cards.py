@@ -2,7 +2,7 @@
 
 import discord
 
-from mafia_game import EliminationOutcome, GameState, Role
+from mafia_game import MAX_PEACEFUL_ROUNDS, EliminationOutcome, GameState, Role
 
 NIGHT_COLOR = 0x7563D9
 MORNING_COLOR = 0xEDB84A
@@ -37,10 +37,12 @@ def game_over_card(game: GameState, outcome: EliminationOutcome, result: str) ->
         if mafia_wins
         else "All Mafia players have been eliminated."
     )
+    if outcome.draw:
+        reason = f"No eliminations for {MAX_PEACEFUL_ROUNDS} consecutive rounds."
     card = discord.Embed(
-        title=f"🏆 {team}!",
+        title="🤝 Draw" if outcome.draw else f"🏆 {team}!",
         description=f"{result}\n\n{reason}",
-        color=MAFIA_COLOR if mafia_wins else CITIZEN_COLOR,
+        color=0x75808A if outcome.draw else MAFIA_COLOR if mafia_wins else CITIZEN_COLOR,
     )
     mafia_count = sum(game.roles[player] == Role.MAFIA for player in outcome.survivors)
     citizens = len(outcome.survivors) - mafia_count
@@ -62,7 +64,7 @@ def morning_card(
         if outcome.victim_id is not None
         else "Nobody was eliminated overnight."
     )
-    if outcome.winner:
+    if outcome.winner or outcome.draw:
         return game_over_card(game, outcome, result)
     card = discord.Embed(
         title=f"☀️ Morning {game.night_number}", description=result, color=MORNING_COLOR
@@ -106,7 +108,7 @@ def vote_result_card(game: GameState, members: dict, outcome: EliminationOutcome
         if outcome.victim_id is not None
         else "No player received a majority. Nobody was eliminated."
     )
-    if outcome.winner:
+    if outcome.winner or outcome.draw:
         return game_over_card(game, outcome, result)
     card = discord.Embed(title="⚖️ Voting result", description=result, color=VOTING_COLOR)
     card.add_field(name="Next", value=f"Night {game.night_number + 1} begins now.", inline=False)
