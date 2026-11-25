@@ -92,10 +92,10 @@ class LifecycleService:
             elif phase == Phase.FINISHED:
                 if (
                     lobby.finished_at is not None
-                    and now - lobby.finished_at >= self.policy.finished_seconds
+                    and now >= lobby.finished_at + self.policy.finished_seconds
                 ):
                     await self.owner.discard_lobby(channel_id, lobby)
-            elif now - lobby.last_activity >= self.policy.idle_seconds:
+            elif now >= lobby.last_activity + self.policy.idle_seconds:
                 await self.owner.close_game(
                     channel_id,
                     lobby,

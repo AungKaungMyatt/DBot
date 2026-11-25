@@ -124,6 +124,15 @@ class LifecycleTests(DiscordGameFixture, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.cog.lobbies)
         self.assertTrue(lobby.game_task.cancelled())
 
+    async def test_fractional_clock_expires_at_exact_idle_deadline(self):
+        lobby = await self.night_game()
+        lobby.last_activity = 126.1364164
+        deadline = lobby.last_activity + self.cog.lifecycle.policy.idle_seconds
+        await self.cog.lifecycle.check_once(now=deadline - 0.000001)
+        self.assertIn(100, self.cog.lobbies)
+        await self.cog.lifecycle.check_once(now=deadline)
+        self.assertFalse(self.cog.lobbies)
+
     async def test_finished_game_is_released_after_retention_time(self):
         lobby = await self.night_game(count=3)
         await self.choose(2)
