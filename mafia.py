@@ -19,6 +19,7 @@ from mafia_cards import (
 )
 from mafia_game import MAX_PLAYERS, MIN_PLAYERS, GameRuleError, GameState, Phase, Role
 from mafia_lifecycle import DepartureNotice, LifecyclePolicy, LifecycleService
+from mafia_restart import notify_interrupted
 
 NIGHT_SECONDS = 120
 DISCUSSION_SECONDS = 120
@@ -69,6 +70,7 @@ class Lobby:
     pending_forfeits: set[int] = field(default_factory=set)
     lifecycle_changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     departure_notice: DepartureNotice | None = field(default=None, repr=False)
+    journal_id: str | None = None
 
 
 class Mafia(commands.Cog):
@@ -78,6 +80,8 @@ class Mafia(commands.Cog):
         discussion_seconds=DISCUSSION_SECONDS,
         voting_seconds=VOTING_SECONDS,
         lifecycle_policy: LifecyclePolicy | None = None,
+        restart_journal=None,
+        bot=None,
     ):
         if not all(
             math.isfinite(value) and value > 0
@@ -91,15 +95,37 @@ class Mafia(commands.Cog):
         self.closing = False
         self.worker_tasks: set[asyncio.Task] = set()
         self.lifecycle = LifecycleService(self, lifecycle_policy or LifecyclePolicy())
+        self.restart_journal = restart_journal
+        self.bot = bot
+        self.recovery_task = None
+        self.recovery_ready = asyncio.Event()
+        if restart_journal is None:
+            self.recovery_ready.set()
 
     def now(self):
         return asyncio.get_running_loop().time()
 
     def touch(self, lobby):
         lobby.last_activity = self.now()
+        if self.restart_journal and lobby.journal_id:
+            self.restart_journal.update_host(lobby.journal_id, lobby.game.host_id)
 
     async def cog_load(self):
         self.lifecycle.start()
+        if self.restart_journal is not None:
+            records = self.restart_journal.records()
+            self.recovery_task = asyncio.create_task(self.recover_interrupted(records))
+
+    async def recover_interrupted(self, records):
+        await self.bot.wait_until_ready()
+        try:
+            await notify_interrupted(
+                self.bot, self.restart_journal, records, self.lifecycle.policy.request_seconds
+            )
+        except Exception:
+            logger.exception("Restart notification failed; undelivered records remain on disk.")
+        finally:
+            self.recovery_ready.set()
 
     async def cog_unload(self):
         """Release all games and cancel their workers when the bot shuts down."""
@@ -107,6 +133,8 @@ class Mafia(commands.Cog):
         lobbies = list(self.lobbies.values())
         self.lobbies.clear()
         tasks = set(self.worker_tasks)
+        if self.recovery_task is not None:
+            tasks.add(self.recovery_task)
         if self.lifecycle.task is not None:
             self.lifecycle.task.cancel()
             tasks.add(self.lifecycle.task)
@@ -123,6 +151,8 @@ class Mafia(commands.Cog):
         if self.lobbies.get(channel_id) is not lobby:
             return
         del self.lobbies[channel_id]
+        if self.restart_journal and lobby.journal_id:
+            self.restart_journal.remove(lobby.journal_id)
         lobby.game.phase = Phase.CANCELLED
         tasks = {
             task
@@ -240,6 +270,7 @@ class Mafia(commands.Cog):
             "`!mafia create` - host a lobby (you join automatically)\n"
             "`!mafia join` / `!mafia leave` - join or leave\n"
             "`!mafia lobby` - show players\n"
+            "`!mafia check` - check this channel and your DMs\n"
             "`!mafia start` - host sends roles and begins Night 1\n"
             "`!mafia kill <player-number>` - Mafia's final choice, in DMs only\n"
             "`!mafia ready` - skip discussion once a majority is ready\n"
@@ -256,6 +287,8 @@ class Mafia(commands.Cog):
     @commands.guild_only()
     async def create(self, ctx):
         """Create a lobby in this server channel and join as host."""
+        if not self.recovery_ready.is_set():
+            raise GameRuleError("Restart checks are in progress. Try creating a lobby shortly.")
         existing = self.lobbies.get(ctx.channel.id)
         if (
             existing
@@ -266,6 +299,11 @@ class Mafia(commands.Cog):
         if ctx.channel.id in self.lobbies:
             raise GameRuleError("This channel already has a lobby. Use `!mafia lobby`.")
         self.require_available(ctx.author.id)
+        session = (
+            self.restart_journal.add(ctx.channel.id, ctx.author.id)
+            if self.restart_journal is not None
+            else None
+        )
         now = self.now()
         self.lobbies[ctx.channel.id] = Lobby(
             game=GameState(ctx.author.id),
@@ -274,6 +312,7 @@ class Mafia(commands.Cog):
             guild=ctx.guild,
             lobby_deadline=now + self.lifecycle.policy.lobby_seconds,
             last_activity=now,
+            journal_id=session,
         )
         await ctx.send(
             f"**Mafia lobby open**\nHost: {ctx.author.mention} • 1/{MAX_PLAYERS} players\n"
@@ -574,6 +613,8 @@ class Mafia(commands.Cog):
         finally:
             if self.lobbies.get(channel_id) is lobby and lobby.game.phase == Phase.FINISHED:
                 lobby.finished_at = self.now()
+                if self.restart_journal and lobby.journal_id:
+                    self.restart_journal.remove(lobby.journal_id)
 
     def begin_departures(self, lobby):
         game = lobby.game
@@ -588,6 +629,7 @@ class Mafia(commands.Cog):
             return
         previous, old_host = game.phase, game.host_id
         outcome = game.forfeit_players(set(players))
+        self.touch(lobby)
         lobby.departure_notice = DepartureNotice(previous, outcome, players, old_host)
         game.phase = Phase.DEPARTING
 
@@ -719,6 +761,45 @@ class Mafia(commands.Cog):
         await self.discard_lobby(ctx.channel.id, lobby)
         await ctx.send("Lobby cancelled. Discard its role DMs. Use `!mafia create` to start fresh.")
 
+    @mafia.command(name="check")
+    @commands.guild_only()
+    @commands.cooldown(1, 30, commands.BucketType.member)
+    async def check_setup(self, ctx):
+        """Check this channel and your own DMs without creating a game."""
+        permissions = ctx.channel.permissions_for(ctx.guild.me)
+        lines = ["**Mafia setup check**"]
+        for label, allowed in (
+            ("View channel", permissions.view_channel),
+            ("Send messages", permissions.send_messages),
+            ("Embed cards", permissions.embed_links),
+        ):
+            lines.append(f"{label}: {'available' if allowed else 'missing'}")
+        try:
+            await asyncio.wait_for(
+                ctx.author.send(
+                    "DBot DM check passed. No game was created and no role was assigned."
+                ),
+                self.lifecycle.policy.request_seconds,
+            )
+            lines.append("Your DMs: delivered successfully")
+        except (discord.HTTPException, TimeoutError):
+            lines.append("Your DMs: could not deliver; check privacy settings or try again later")
+        lines.append(
+            "This checks only your account and this channel. Other players must check too."
+        )
+        report = "\n".join(lines)
+        try:
+            await asyncio.wait_for(ctx.send(report), self.lifecycle.policy.request_seconds)
+        except (discord.HTTPException, TimeoutError):
+            try:
+                await asyncio.wait_for(
+                    ctx.author.send(report), self.lifecycle.policy.request_seconds
+                )
+            except (discord.HTTPException, TimeoutError):
+                logger.warning(
+                    "Setup check could not report results in channel %s.", ctx.channel.id
+                )
+
     @mafia.command(ignore_extra=False)
     @commands.guild_only()
     async def transfer(self, ctx, player_number: int):
@@ -774,6 +855,10 @@ class Mafia(commands.Cog):
         elif isinstance(error, commands.MissingPermissions):
             await ctx.send(
                 "Only a server moderator with Manage Server can use `!mafia forcecancel`."
+            )
+        elif isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(
+                f"Please wait {math.ceil(error.retry_after)} seconds before checking again."
             )
         elif isinstance(error, commands.UserInputError):
             if ctx.command and ctx.command.qualified_name == "mafia kill":

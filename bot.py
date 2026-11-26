@@ -9,12 +9,14 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from mafia import Mafia
+from mafia_restart import RestartJournal
 
 
 class DBot(commands.Bot):
     async def setup_hook(self):
         # A cog groups related commands and their shared game state.
-        await self.add_cog(Mafia())
+        journal = RestartJournal(Path(__file__).with_name(".local") / "restart.sqlite3")
+        await self.add_cog(Mafia(restart_journal=journal, bot=self))
 
 
 # Intents tell Discord which events our bot needs to receive.

@@ -10,7 +10,7 @@ line-ending = "lf"
 
 [tool.coverage.run]
 branch = true
-source = ["bot", "mafia", "mafia_cards", "mafia_game", "mafia_lifecycle", "scripts.simulate_games"]
+source = ["bot", "mafia", "mafia_cards", "mafia_game", "mafia_lifecycle", "mafia_restart", "scripts.simulate_games"]
 
 [tool.coverage.report]
 show_missing = true

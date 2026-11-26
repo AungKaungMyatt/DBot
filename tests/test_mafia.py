@@ -341,7 +341,9 @@ class MafiaTests(DiscordGameFixture, unittest.IsolatedAsyncioTestCase):
         from bot import DBot
 
         async with DBot(command_prefix="!", intents=discord.Intents.default()) as client:
-            await client.setup_hook()
+            # Registration must not open the operator's real restart database.
+            with patch("bot.RestartJournal", return_value=None):
+                await client.setup_hook()
             for name in (
                 "create",
                 "join",
@@ -352,6 +354,10 @@ class MafiaTests(DiscordGameFixture, unittest.IsolatedAsyncioTestCase):
                 "kill",
                 "ready",
                 "vote",
+                "check",
+                "transfer",
+                "forfeit",
+                "forcecancel",
             ):
                 self.assertIsNotNone(client.get_command(f"mafia {name}"))
             self.assertIsNone(client.get_command("mafia morning"))
